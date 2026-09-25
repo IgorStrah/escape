@@ -1,18 +1,18 @@
 /*
- * ТЕСТ ЖЕЛЕЗА: МУЛЬТИПЛЕКСОРЫ + WS2812 + WiFi/OTA
+ * МАСКИ + СВЕЧИ — хрономаг, устройство «Огонь чернокнижника»
  * ESP32-C3 SuperMini  /  PlatformIO (framework = arduino)
  *
  * MUX1 (GPIO3) - цифра, 16 каналов, маски 1-16
  * MUX2 (GPIO4) - аналог, кан 0-2 маски 17-19, кан 3-10 свечи 1-8
  * WS2812 (GPIO1) - 38 диодов, по 2 на маску
  *
- * Что делает:
- *   - постоянно опрашивает все входы, печатает события нажатий масок
- *   - раз в секунду печатает сырые значения фоторезисторов свечей
- *   - глаза нажатой маски загораются красным (проверка ленты)
- *   - поднимает WiFi (статический IP) и OTA
+ * Через MQTT (TestHub на стенде, chrono-hub.local):
+ *   quest/chronomage/masks/...   — маски: обычный режим, калибровка
+ *                                  пар (CALIBRATE_START/SKIP/ABORT),
+ *                                  тестовый прогон игры (START_MASKS_TEST),
+ *                                  таймаут касания (SET_TIMEOUT:<мс>)
+ *   quest/chronomage/candles/... — сырые ADC свечей (без сравнения с паттерном)
  *
- * Команд по UART НЕТ. MQTT будет добавлен позже.
  * Прошивка по воздуху: PlatformIO -> upload_port = chrono-masks.local
  */
 
@@ -20,6 +20,8 @@
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <Adafruit_NeoPixel.h>
+#include <PubSubClient.h>
+#include <esp_system.h>
 
 // ============================================================
 // КОНФИГУРАЦИЯ
@@ -43,6 +45,39 @@ IPAddress subnet  (255, 255, 255, 0);
 IPAddress dns1    (192, 168, 8, 1);
 
 #define WIFI_RETRY_MS   5000
+
+// ---- MQTT (тестовый хаб TestHub, стенд) ----
+// Хаб на DHCP, поэтому по имени через mDNS, а не по фиксированному IP.
+#define MQTT_HOST         "chrono-hub.local"
+#define MQTT_PORT         1883
+#define MQTT_CLIENT_ID    "chrono-masks"
+#define MQTT_DEVICE_TOPIC "quest/chronomage/masks"
+#define MQTT_RECONNECT_MS 4000
+#define MQTT_PUBLISH_MS   4000
+#define MQTT_BUTTONS_REPUBLISH_MS (3UL * 60UL * 1000UL)
+
+#define MQTT_TOPIC_INFO    MQTT_DEVICE_TOPIC "/info"
+#define MQTT_TOPIC_STATE   MQTT_DEVICE_TOPIC "/state"
+#define MQTT_TOPIC_RSSI    MQTT_DEVICE_TOPIC "/rssi"
+#define MQTT_TOPIC_BUTTONS MQTT_DEVICE_TOPIC "/buttons"
+#define MQTT_TOPIC_CMD     MQTT_DEVICE_TOPIC "/cmd"
+
+// Свечи публикуются под отдельным именем устройства — по ТЗ это отдельное
+// задание квеста, хоть и живёт физически на той же плате.
+#define MQTT_CANDLES_TOPIC        "quest/chronomage/candles"
+#define MQTT_TOPIC_CANDLES_INFO   MQTT_CANDLES_TOPIC "/info"
+#define MQTT_TOPIC_CANDLES_STATE  MQTT_CANDLES_TOPIC "/state"
+
+// Формат кнопок — как у боевых устройств комнаты: метка:топик:payload,
+// через "|". Клик на хабе публикует именно topic/payload, а не всегда /cmd.
+// start_masks — тестовая кнопка: сама генерирует случайный порядок и
+// запускает игровую логику локально, без реального quest/.../cycle/start.
+#define MQTT_BUTTONS_PAYLOAD \
+  "calibrate:" MQTT_TOPIC_CMD ":CALIBRATE_START|" \
+  "calib_skip:" MQTT_TOPIC_CMD ":CALIBRATE_SKIP|" \
+  "calib_abort:" MQTT_TOPIC_CMD ":CALIBRATE_ABORT|" \
+  "start_masks:" MQTT_TOPIC_CMD ":START_MASKS_TEST|" \
+  "stop_masks:" MQTT_TOPIC_CMD ":STOP_MASKS_TEST"
 
 // ---- Пины ----
 #define MUX_S0    5
@@ -74,25 +109,47 @@ IPAddress dns1    (192, 168, 8, 1);
 #define MASK_THRESHOLD  2000   // аналоговое чтение TTP223 на MUX2
 
 // ---- Прочее ----
-#define CANDLE_PRINT_MS 1000
 #define STATS_PRINT_MS  10000
-#define LED_BRIGHTNESS    40
+#define LED_BRIGHTNESS  40
 
-// Бегущая строка при нажатии любой маски: каждая пара горит SHOW_STEP_MS,
-// затем гаснет и загорается следующая. Всего проход = 19 * SHOW_STEP_MS.
-#define SHOW_STEP_MS     1000
+// ---- Тайминги игры "маски" ----
+#define DEFAULT_MASK_TIMEOUT_MS 2000   // сколько ждать касание активной маски
+#define MIN_MASK_TIMEOUT_MS      200
+#define MAX_MASK_TIMEOUT_MS    20000
+
+#define CANDLE_PUBLISH_MS  1000
+
+// ---- Мерцание пламени / цепочка касаний в простое ----
+#define FLICKER_UPDATE_MS  80
+#define FLICKER_MIN_RED     5
+#define FLICKER_MAX_RED    20   // "от 5 до 20" на красный канал
 
 // ============================================================
 // ТАБЛИЦА: МАСКА -> ПАРА СВЕТОДИОДОВ
 // Индекс = номер маски минус 1. Значение = номер пары (0..18),
 // пара N = диоды N*2 и N*2+1. Единственное место правки при монтаже.
+// Получено калибровкой (CALIBRATE_START) на живом железе.
 // ============================================================
 uint8_t maskToLedPair[MASK_COUNT] = {
-   0,  1,  2,  3,  4,  5,  6,  7,  8,  9,
-  10, 11, 12, 13, 14, 15,
-  16,   // маска 17 (MUX2 кан 0)
-  17,   // маска 18 (MUX2 кан 1)
-  18    // маска 19 (MUX2 кан 2)
+  11,   // маска 1
+  12,   // маска 2
+  13,   // маска 3
+  14,   // маска 4
+  16,   // маска 5
+  15,   // маска 6
+  17,   // маска 7
+  18,   // маска 8
+  10,   // маска 9
+   9,   // маска 10
+   8,   // маска 11
+   7,   // маска 12
+   6,   // маска 13
+   5,   // маска 14
+   4,   // маска 15
+   3,   // маска 16
+   2,   // маска 17 (MUX2 кан 0)
+   1,   // маска 18 (MUX2 кан 1)
+   0    // маска 19 (MUX2 кан 2)
 };
 
 // ============================================================
@@ -108,10 +165,12 @@ uint8_t candleToChannel[MUX2_CANDLE_COUNT] = {
 #define COL_WHITE   255, 255, 255
 #define COL_GREEN   0, 255, 0
 #define COL_BLUE    0, 0, 255
-#define COL_SHOW    COL_WHITE   // цвет бегущей строки
 
 // ==================== ОБЪЕКТЫ ====================
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+WiFiClient   mqttNet;
+PubSubClient mqttClient(mqttNet);
 
 // ==================== СОСТОЯНИЕ ====================
 bool    mux1State[MUX1_CHANNELS];
@@ -123,8 +182,8 @@ bool    mux2MaskCandidate[MUX2_MASK_COUNT];
 uint8_t mux2MaskCounter[MUX2_MASK_COUNT];
 
 int     candleRaw[MUX2_CANDLE_COUNT];
+unsigned long lastCandlePublish = 0;
 
-unsigned long lastCandlePrint = 0;
 unsigned long lastStatsTime   = 0;
 unsigned long lastWifiTry     = 0;
 unsigned long loopCount       = 0;
@@ -135,10 +194,56 @@ bool otaInProgress   = false;
 bool wifiWasConnected = false;
 bool otaStarted       = false;
 
-// Бегущая строка по нажатию
-bool          showRunning = false;
-uint8_t       showPair    = 0;
-unsigned long showTime    = 0;
+unsigned long lastMqttReconnect     = 0;
+unsigned long lastMqttPublish       = 0;
+unsigned long lastButtonsPublish    = 0;
+bool mqttNeedInitialPublish = false;   // выставляется true при (пере)подключении
+
+// info — подробный человекочитаемый текст (что произошло).
+// state — короткое машинное значение (режим устройства).
+char infoMsg[128] = "маски+свечи, ESP32-C3 (только кнопки/LED, без фотодатчиков)";
+char stateMsg[48] = "IDLE";
+
+// ==================== КАЛИБРОВКА МАСКА<->ПАРА ====================
+bool    calibMode          = false;
+int     calibPairIndex     = -1;     // текущая проверяемая пара (-1 = ещё не начали)
+bool    calibWaiting       = false;  // ждём нажатия для текущей пары
+unsigned long calibConfirmUntil = 0; // до какого millis() держим зелёное подтверждение
+uint8_t calibAssignedPair[MASK_COUNT]; // индекс = maskNum-1, значение = найденная пара (0xFF = не найдена)
+
+// ==================== ИГРА "МАСКИ" (тестовый прогон) ====================
+unsigned long maskTimeoutMs = DEFAULT_MASK_TIMEOUT_MS;  // настраивается командой SET_TIMEOUT:<мс>
+bool          gameActive    = false;
+int           gameIndex     = -1;
+uint8_t       gameOrder[MASK_COUNT];
+unsigned long gameDeadline  = 0;
+
+// ==================== ОГОНЬ: МЕРЦАНИЕ + СЦЕНАРИЙ КАСАНИЙ ====================
+// Активно только вне калибровки и явного теста (start_masks).
+// Сценарий — случайный порядок всех 19 масок, сам пересобирается раз в
+// SCENARIO_REGEN_MS (не зависит от того, играет ли сейчас кто-то).
+// Любое касание в дежурном режиме "вооружает" прохождение (само касание
+// не засчитывается) — загорается синим ПЕРВАЯ маска текущего сценария.
+// Коснулся именно её вовремя (SCENARIO_TOUCH_MS) -> белая, загорается
+// синим следующая по сценарию. Не успел -> полный сброс на позицию 0,
+// все маски обратно мерцают красным, ждём новое "вооружающее" касание.
+#define VIS_FLICKER 0
+#define VIS_TARGET  1
+#define VIS_DONE    2
+#define VIS_CELEBRATE 3   // весь сценарий пройден — держим зелёный до новой генерации
+uint8_t maskVisualState[MASK_COUNT];   // индекс = maskNum-1
+
+unsigned long lastFlickerUpdate = 0;
+
+#define SCENARIO_REGEN_MS (3UL * 60UL * 1000UL)   // новый сценарий каждые 3 мин
+#define SCENARIO_TOUCH_MS 3000                     // 3 сек на текущую синюю цель
+
+uint8_t       scenarioOrder[MASK_COUNT];   // текущий случайный порядок (значения 1..19)
+unsigned long lastScenarioGen = 0;
+
+bool          chaseActive         = false;  // "вооружено", прохождение идёт
+int           chaseIndex          = -1;     // позиция в scenarioOrder, -1 = не начато
+unsigned long chaseTargetDeadline = 0;       // дедлайн на текущую синюю цель
 
 // ==================== ПРОТОТИПЫ ====================
 void setMuxChannel(uint8_t ch);
@@ -150,12 +255,38 @@ void clearAllLeds();
 void wifiConnect();
 void wifiCheck();
 void otaSetup();
+void mqttCheck();
+void mqttPublishPeriodic();
+void mqttCallback(char *topic, uint8_t *payload, unsigned int length);
+void publishInfo(const char *text);
+void publishState(const char *text);
+void handleMaskTransition(uint8_t maskNum, int channel, const char *muxLabel, bool pressed);
 void scanMux1();
 void scanMux2();
-void startShow();
-void handleShow();
-void printCandles();
 void dumpAll();
+void calibStart();
+void calibSkip();
+void calibAbort();
+void calibFinish();
+void calibLoop();
+void calibShowPair(int pair);
+void calibHandlePress(uint8_t maskNum, int channel, const char *muxLabel);
+void publishCandles();
+void gameStart();
+void gameStop();
+void gameShowActive();
+void gameHandleTouch(uint8_t maskNum);
+void gameFinish();
+void gameLoop();
+void updateFlicker();
+void scenarioGenerate();
+void scenarioCheck();
+void chaseArm();
+void chaseHandleTouch(uint8_t maskNum);
+void chaseTimeoutCheck();
+void chaseFinish();
+void chaseReset();
+void chaseStop();
 
 // ==================== МУЛЬТИПЛЕКСОР ====================
 void setMuxChannel(uint8_t ch) {
@@ -202,33 +333,6 @@ void clearAllLeds() {
   strip.show();
 }
 
-// ==================== БЕГУЩАЯ СТРОКА ПО НАЖАТИЮ ====================
-// Запуск (или перезапуск, если уже идёт) с первой пары
-void startShow() {
-  showRunning = true;
-  showPair = 0;
-  showTime = 0;   // 0 -> первый шаг сработает сразу в handleShow()
-}
-
-// Неблокирующий шаг: раз в SHOW_STEP_MS двигаем горящую пару дальше
-void handleShow() {
-  if (!showRunning) return;
-  if (showTime != 0 && millis() - showTime < SHOW_STEP_MS) return;
-
-  showTime = millis();
-
-  if (showPair >= MASK_COUNT) {   // дошли до конца — гасим и выходим
-    showRunning = false;
-    strip.clear();
-    strip.show();
-    return;
-  }
-
-  strip.clear();
-  setPairColor(showPair, COL_SHOW);
-  strip.show();
-  showPair++;
-}
 
 // ==================== WIFI ====================
 void wifiConnect() {
@@ -326,6 +430,483 @@ void otaSetup() {
   Serial.println(OTA_HOSTNAME);
 }
 
+// ==================== MQTT (тестовый хаб) ====================
+void publishInfo(const char *text) {
+  strncpy(infoMsg, text, sizeof(infoMsg) - 1);
+  infoMsg[sizeof(infoMsg) - 1] = '\0';
+  Serial.println(infoMsg);
+  if (mqttClient.connected()) mqttClient.publish(MQTT_TOPIC_INFO, infoMsg, true);
+}
+
+void publishState(const char *text) {
+  strncpy(stateMsg, text, sizeof(stateMsg) - 1);
+  stateMsg[sizeof(stateMsg) - 1] = '\0';
+  if (mqttClient.connected()) mqttClient.publish(MQTT_TOPIC_STATE, stateMsg, true);
+}
+
+// Команды от хаба: quest/chronomage/masks/cmd
+void mqttCallback(char *topic, uint8_t *payload, unsigned int length) {
+  char buf[32] = {0};
+  unsigned int n = length < sizeof(buf) - 1 ? length : sizeof(buf) - 1;
+  memcpy(buf, payload, n);
+
+  Serial.print("[MQTT cmd] ");
+  Serial.println(buf);
+
+  if      (strcmp(buf, "CALIBRATE_START")   == 0) calibStart();
+  else if (strcmp(buf, "CALIBRATE_SKIP")    == 0) calibSkip();
+  else if (strcmp(buf, "CALIBRATE_ABORT")   == 0) calibAbort();
+  else if (strcmp(buf, "START_MASKS_TEST")  == 0) gameStart();
+  else if (strcmp(buf, "STOP_MASKS_TEST")   == 0) { gameStop(); chaseStop(); }
+  else if (strncmp(buf, "SET_TIMEOUT:", 12) == 0) {
+    long ms = atol(buf + 12);
+    if (ms < MIN_MASK_TIMEOUT_MS) ms = MIN_MASK_TIMEOUT_MS;
+    if (ms > MAX_MASK_TIMEOUT_MS) ms = MAX_MASK_TIMEOUT_MS;
+    maskTimeoutMs = (unsigned long)ms;
+
+    char msg[48];
+    snprintf(msg, sizeof(msg), "таймаут маски: %lu мс", maskTimeoutMs);
+    publishInfo(msg);
+  }
+}
+
+// Неблокирующее (пере)подключение — вызывать каждый оборот loop().
+void mqttCheck() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  if (mqttClient.connected()) {
+    mqttClient.loop();
+    return;
+  }
+
+  mqttNeedInitialPublish = false;
+
+  if (millis() - lastMqttReconnect < MQTT_RECONNECT_MS) return;
+  lastMqttReconnect = millis();
+
+  Serial.print("[MQTT] подключение к ");
+  Serial.print(MQTT_HOST);
+  Serial.print(" ... ");
+
+  if (mqttClient.connect(MQTT_CLIENT_ID)) {
+    Serial.println("ок");
+    mqttClient.subscribe(MQTT_TOPIC_CMD);
+    mqttNeedInitialPublish = true;
+  } else {
+    Serial.print("не вышло, state=");
+    Serial.println(mqttClient.state());
+  }
+}
+
+// После (пере)подключения — info/state/buttons сразу (retain). Дальше:
+// rssi раз в MQTT_PUBLISH_MS, buttons повторно раз в MQTT_BUTTONS_REPUBLISH_MS
+// (на случай если хаб перезапустился и не увидел retain).
+void mqttPublishPeriodic() {
+  if (!mqttClient.connected()) return;
+
+  if (mqttNeedInitialPublish) {
+    mqttClient.publish(MQTT_TOPIC_INFO, infoMsg, true);
+    mqttClient.publish(MQTT_TOPIC_STATE, stateMsg, true);
+    mqttClient.publish(MQTT_TOPIC_BUTTONS, MQTT_BUTTONS_PAYLOAD, true);
+    mqttClient.publish(MQTT_TOPIC_CANDLES_STATE, "READING", true);
+    lastButtonsPublish = millis();
+    mqttNeedInitialPublish = false;
+  }
+
+  if (millis() - lastMqttPublish >= MQTT_PUBLISH_MS) {
+    lastMqttPublish = millis();
+    mqttClient.publish(MQTT_TOPIC_RSSI, String(WiFi.RSSI()).c_str());
+  }
+
+  if (millis() - lastButtonsPublish >= MQTT_BUTTONS_REPUBLISH_MS) {
+    lastButtonsPublish = millis();
+    mqttClient.publish(MQTT_TOPIC_BUTTONS, MQTT_BUTTONS_PAYLOAD, true);
+  }
+
+  if (millis() - lastCandlePublish >= CANDLE_PUBLISH_MS) {
+    lastCandlePublish = millis();
+    publishCandles();
+  }
+}
+
+// Общая точка входа для любого подтверждённого изменения кнопки —
+// решает, идёт ли это в калибровку, явный тест (start_masks) или в
+// дежурную цепочку "огонь" (по умолчанию). Отпускание вне калибровки/игры
+// визуально ничего не значит — цвет теперь определяется maskVisualState.
+void handleMaskTransition(uint8_t maskNum, int channel, const char *muxLabel, bool pressed) {
+  if (calibMode) {
+    if (pressed) calibHandlePress(maskNum, channel, muxLabel);
+    return;
+  }
+  if (gameActive) {
+    if (pressed) gameHandleTouch(maskNum);
+    return;
+  }
+  if (pressed) chaseHandleTouch(maskNum);
+}
+
+// Сырые ADC-значения фоторезисторов свечей — отдельное "устройство"
+// quest/chronomage/candles на хабе, понятная строка для индикации.
+void publishCandles() {
+  char buf[128];
+  int off = 0;
+  for (uint8_t i = 0; i < MUX2_CANDLE_COUNT; i++) {
+    off += snprintf(buf + off, sizeof(buf) - off, "C%u=%d ", i + 1, candleRaw[i]);
+    if (off >= (int)sizeof(buf)) break;
+  }
+  Serial.print("[СВЕЧИ] ");
+  Serial.println(buf);
+  if (mqttClient.connected()) mqttClient.publish(MQTT_TOPIC_CANDLES_INFO, buf, true);
+}
+
+// ==================== КАЛИБРОВКА МАСКА<->ПАРА ====================
+void calibShowPair(int pair) {
+  strip.clear();
+  setPairColor(pair, COL_WHITE);
+  strip.show();
+
+  char buf[80];
+  snprintf(buf, sizeof(buf), "калибровка: пара %d/%d, жду нажатия...", pair + 1, MASK_COUNT);
+  publishInfo(buf);
+}
+
+void calibStart() {
+  if (gameActive) {
+    publishInfo("нельзя начать калибровку: идёт тест масок");
+    return;
+  }
+
+  chaseReset();   // ленту забирает калибровка — цепочку гасим до её конца
+
+  calibMode      = true;
+  calibPairIndex = -1;
+  calibWaiting   = false;
+  calibConfirmUntil = 0;   // уже "в прошлом" -> calibLoop() сразу покажет пару 0
+
+  for (uint8_t i = 0; i < MASK_COUNT; i++) calibAssignedPair[i] = 0xFF;
+
+  publishState("CALIBRATING");
+  publishInfo("калибровка начата");
+  Serial.println("[КАЛИБРОВКА] старт");
+}
+
+void calibSkip() {
+  if (!calibMode || !calibWaiting) return;
+
+  char buf[48];
+  snprintf(buf, sizeof(buf), "пара %d пропущена", calibPairIndex + 1);
+  publishInfo(buf);
+
+  calibWaiting = false;
+  calibConfirmUntil = millis();   // без задержки -> calibLoop() сразу пойдёт дальше
+}
+
+void calibAbort() {
+  if (!calibMode) return;
+  calibMode = false;
+  clearAllLeds();
+  publishState("IDLE");
+  publishInfo("калибровка отменена, таблица не менялась");
+  Serial.println("[КАЛИБРОВКА] отменена");
+}
+
+void calibHandlePress(uint8_t maskNum, int channel, const char *muxLabel) {
+  if (!calibWaiting) return;   // сейчас не ждём (идёт подтверждение/переход)
+
+  calibAssignedPair[maskNum - 1] = (uint8_t)calibPairIndex;
+
+  char buf[80];
+  snprintf(buf, sizeof(buf), "пара %d -> маска %u (%s кан %d)",
+           calibPairIndex + 1, maskNum, muxLabel, channel);
+  publishInfo(buf);
+
+  setPairColor(calibPairIndex, COL_GREEN);
+  strip.show();
+
+  calibWaiting = false;
+  calibConfirmUntil = millis() + 500;   // держим зелёный 500мс, потом дальше
+}
+
+void calibFinish() {
+  calibMode = false;
+  clearAllLeds();
+
+  Serial.println();
+  Serial.println("---------- РЕЗУЛЬТАТ КАЛИБРОВКИ (скопировать в maskToLedPair[]) ----------");
+  Serial.println("uint8_t maskToLedPair[MASK_COUNT] = {");
+  char csv[96] = {0};
+  for (uint8_t i = 0; i < MASK_COUNT; i++) {
+    uint8_t pair = calibAssignedPair[i];
+    char line[48];
+    if (pair == 0xFF) {
+      snprintf(line, sizeof(line), "  255,  // маска %u НЕ НАЙДЕНА", i + 1);
+    } else {
+      snprintf(line, sizeof(line), "  %u,  // маска %u", pair, i + 1);
+    }
+    Serial.println(line);
+
+    char num[8];
+    snprintf(num, sizeof(num), "%s%u", i == 0 ? "" : ",", pair == 0xFF ? 255 : pair);
+    strncat(csv, num, sizeof(csv) - strlen(csv) - 1);
+  }
+  Serial.println("};");
+  Serial.println("---------------------------------------------------------------------------");
+  Serial.println();
+
+  publishState(csv);   // компактный список пар по порядку маска1..19 — виден на хабе
+  publishInfo("калибровка завершена, таблица в Serial (скопируй в maskToLedPair[])");
+}
+
+// Вызывается каждый loop(), пока calibMode == true. Неблокирующий шаг.
+void calibLoop() {
+  if (!calibMode) return;
+  if (calibWaiting) return;                       // ждём нажатия — ничего не делаем
+  if (millis() < calibConfirmUntil) return;        // ещё показываем подтверждение
+
+  calibPairIndex++;
+  if (calibPairIndex >= MASK_COUNT) {
+    calibFinish();
+    return;
+  }
+
+  calibWaiting = true;
+  calibShowPair(calibPairIndex);
+}
+
+// ==================== ОГОНЬ: МЕРЦАНИЕ + СЦЕНАРИЙ КАСАНИЙ ====================
+// Дежурное мерцание: маски в состоянии VIS_FLICKER дрожат красным 0..15
+// каждые FLICKER_UPDATE_MS. Не трогает калибровку/игру и маски, занятые
+// сценарием (цель/поймана).
+void updateFlicker() {
+  if (calibMode || gameActive) return;
+  if (millis() - lastFlickerUpdate < FLICKER_UPDATE_MS) return;
+  lastFlickerUpdate = millis();
+
+  bool changed = false;
+  for (uint8_t maskNum = 1; maskNum <= MASK_COUNT; maskNum++) {
+    if (maskVisualState[maskNum - 1] != VIS_FLICKER) continue;
+    setMaskColor(maskNum, random(FLICKER_MIN_RED, FLICKER_MAX_RED + 1), 0, 0);
+    changed = true;
+  }
+  if (changed) strip.show();
+}
+
+// Пересобирает случайный порядок всех 19 масок. Если в этот момент шло
+// прохождение — тихо сбрасываем его (сценарий сменился, старый прогресс
+// по нему больше не валиден).
+void scenarioGenerate() {
+  lastScenarioGen = millis();
+
+  for (uint8_t i = 0; i < MASK_COUNT; i++) scenarioOrder[i] = i + 1;
+  for (uint8_t i = MASK_COUNT - 1; i > 0; i--) {   // Fisher-Yates
+    uint8_t j = random(i + 1);
+    uint8_t tmp = scenarioOrder[i];
+    scenarioOrder[i] = scenarioOrder[j];
+    scenarioOrder[j] = tmp;
+  }
+
+  Serial.print("[СЦЕНАРИЙ] новый порядок: ");
+  for (uint8_t i = 0; i < MASK_COUNT; i++) {
+    Serial.print(scenarioOrder[i]);
+    Serial.print(i + 1 < MASK_COUNT ? "," : "\n");
+  }
+
+  chaseReset();   // новый сценарий -> сбросить и прогресс, и зелёный "победный" фон
+}
+
+// Вызывать каждый loop() — раз в SCENARIO_REGEN_MS пересобирает сценарий.
+void scenarioCheck() {
+  if (millis() - lastScenarioGen >= SCENARIO_REGEN_MS) scenarioGenerate();
+}
+
+// "Вооружает" прохождение: показывает синим первую маску текущего
+// сценария. Само касание, которое привело сюда, не засчитывается —
+// даже если случайно попали в ту же маску, её всё равно нужно тронуть
+// ещё раз, пока она синяя.
+void chaseArm() {
+  chaseActive = true;
+  chaseIndex  = 0;
+
+  uint8_t target = scenarioOrder[chaseIndex];
+  maskVisualState[target - 1] = VIS_TARGET;
+  setMaskColor(target, COL_BLUE);
+  strip.show();
+
+  chaseTargetDeadline = millis() + SCENARIO_TOUCH_MS;
+
+  char buf[96];
+  snprintf(buf, sizeof(buf), "огонь: старт сценария, цель — маска %u (1/%d)", target, MASK_COUNT);
+  publishInfo(buf);
+  publishState("CHASE_ACTIVE");
+}
+
+// Любое касание вне калибровки/игры идёт сюда.
+void chaseHandleTouch(uint8_t maskNum) {
+  if (!chaseActive) {
+    chaseArm();   // касание только запускает прохождение, не засчитывается
+    return;
+  }
+
+  uint8_t target = scenarioOrder[chaseIndex];
+  if (maskNum != target) return;   // не та цель — игнор, ждём таймаут или верную
+
+  maskVisualState[target - 1] = VIS_DONE;
+  setMaskColor(target, COL_WHITE);
+
+  chaseIndex++;
+  if (chaseIndex >= MASK_COUNT) {
+    chaseFinish();
+    return;
+  }
+
+  uint8_t nextTarget = scenarioOrder[chaseIndex];
+  maskVisualState[nextTarget - 1] = VIS_TARGET;
+  setMaskColor(nextTarget, COL_BLUE);
+  strip.show();
+
+  chaseTargetDeadline = millis() + SCENARIO_TOUCH_MS;
+
+  char buf[96];
+  snprintf(buf, sizeof(buf), "огонь: маска %u поймана, цель — маска %u (%d/%d)",
+           target, nextTarget, chaseIndex + 1, MASK_COUNT);
+  publishInfo(buf);
+}
+
+// Вызывать каждый loop(), пока chaseActive == true. 3 сек не тронули
+// текущую синюю цель — полный сброс на позицию 0, все маски мерцают.
+void chaseTimeoutCheck() {
+  if (!chaseActive) return;
+  if (millis() < chaseTargetDeadline) return;
+
+  uint8_t target = scenarioOrder[chaseIndex];
+  chaseReset();
+
+  char buf[80];
+  snprintf(buf, sizeof(buf), "огонь: не успели маску %u — сброс на позицию 0", target);
+  publishInfo(buf);
+  publishState("IDLE");
+}
+
+// Держит всю ленту зелёной (COL_GREEN на общей LED_BRIGHTNESS=40 -> видимо
+// ~40/255 ≈ 15%) до следующей генерации сценария — VIS_CELEBRATE не трогает
+// updateFlicker(), так что мерцание не перерисует поверх.
+void chaseFinish() {
+  chaseActive = false;
+  chaseIndex  = -1;
+  for (uint8_t i = 0; i < MASK_COUNT; i++) maskVisualState[i] = VIS_CELEBRATE;
+  for (uint8_t p = 0; p < MASK_COUNT; p++) setPairColor(p, COL_GREEN);
+  strip.show();
+  publishState("MASKS_DONE");
+  publishInfo("огонь: сценарий пройден полностью, держим зелёный до новой генерации");
+}
+
+// Тихий сброс без сообщений — вызывается перед тем как калибровка/игра
+// забирают ленту себе, и при смене сценария посреди прохождения.
+void chaseReset() {
+  chaseActive = false;
+  chaseIndex  = -1;
+  for (uint8_t i = 0; i < MASK_COUNT; i++) maskVisualState[i] = VIS_FLICKER;
+}
+
+// Ручная остановка (STOP_MASKS_TEST) — с сообщением на хаб.
+void chaseStop() {
+  if (!chaseActive) return;
+  chaseReset();
+  publishState("IDLE");
+  publishInfo("огонь: сценарий остановлен вручную, дежурный режим");
+}
+
+// ==================== ИГРА "МАСКИ" (тестовый прогон, кнопка start_masks) ====================
+// Зажигает текущую активную маску красным, перезапускает таймер ожидания.
+void gameShowActive() {
+  uint8_t maskNum = gameOrder[gameIndex];
+
+  strip.clear();
+  setMaskColor(maskNum, COL_RED);
+  strip.show();
+
+  gameDeadline = millis() + maskTimeoutMs;
+
+  char buf[96];
+  snprintf(buf, sizeof(buf), "тест масок: прогресс %d/%d, активна маска %u",
+           gameIndex, MASK_COUNT, maskNum);
+  publishInfo(buf);
+}
+
+// Кнопка start_masks: свой случайный порядок, без реального cycle/start.
+void gameStart() {
+  if (calibMode) {
+    publishInfo("нельзя стартовать тест масок: идёт калибровка");
+    return;
+  }
+
+  chaseReset();   // ленту забирает тест — цепочку гасим до его конца
+
+  for (uint8_t i = 0; i < MASK_COUNT; i++) gameOrder[i] = i + 1;
+  for (uint8_t i = MASK_COUNT - 1; i > 0; i--) {   // Fisher-Yates
+    uint8_t j = random(i + 1);
+    uint8_t tmp = gameOrder[i];
+    gameOrder[i] = gameOrder[j];
+    gameOrder[j] = tmp;
+  }
+
+  Serial.print("[ТЕСТ МАСОК] порядок: ");
+  for (uint8_t i = 0; i < MASK_COUNT; i++) {
+    Serial.print(gameOrder[i]);
+    Serial.print(i + 1 < MASK_COUNT ? "," : "\n");
+  }
+
+  gameActive = true;
+  gameIndex  = 0;
+  publishState("GAME_RUNNING");
+  gameShowActive();
+}
+
+void gameStop() {
+  if (!gameActive) return;
+  gameActive = false;
+  clearAllLeds();
+  publishState("IDLE");
+  publishInfo("тест масок остановлен вручную");
+}
+
+void gameHandleTouch(uint8_t maskNum) {
+  if (!gameActive) return;
+  if (maskNum != gameOrder[gameIndex]) return;   // не та маска — просто игнор
+
+  setMaskColor(maskNum, COL_WHITE);
+  strip.show();
+
+  gameIndex++;
+  if (gameIndex >= MASK_COUNT) {
+    gameFinish();
+    return;
+  }
+  gameShowActive();
+}
+
+void gameFinish() {
+  gameActive = false;
+  for (uint8_t p = 0; p < MASK_COUNT; p++) setPairColor(p, COL_GREEN);
+  strip.show();
+  publishState("MASKS_DONE");
+  publishInfo("тест масок пройден: все 19 по порядку");
+}
+
+// Вызывается каждый loop(), пока gameActive == true. Неблокирующий шаг.
+void gameLoop() {
+  if (!gameActive) return;
+  if (millis() < gameDeadline) return;
+
+  char buf[112];
+  snprintf(buf, sizeof(buf), "не успели маску %u (таймаут %lu мс) — сброс на начало",
+           gameOrder[gameIndex], maskTimeoutMs);
+  publishInfo(buf);
+
+  gameIndex = 0;
+  gameShowActive();
+}
+
 // ==================== ОПРОС MUX1 (маски 1-16) ====================
 void scanMux1() {
   for (uint8_t ch = 0; ch < MUX1_CHANNELS; ch++) {
@@ -343,15 +924,7 @@ void scanMux1() {
         mux1Counter[ch] = 0;
 
         uint8_t maskNum = ch + 1;
-
-        Serial.print("[МАСКА ");
-        Serial.print(maskNum);
-        Serial.print("] MUX1 кан ");
-        Serial.print(ch);
-        Serial.print(" -> ");
-        Serial.println(val ? "НАЖАТА" : "отпущена");
-
-        if (val) startShow();   // любое нажатие запускает бегущую строку
+        handleMaskTransition(maskNum, ch, "MUX1", val);
       }
     } else {
       mux1Candidate[ch] = val;
@@ -380,17 +953,7 @@ void scanMux2() {
         mux2MaskCounter[i] = 0;
 
         uint8_t maskNum = 17 + i;
-
-        Serial.print("[МАСКА ");
-        Serial.print(maskNum);
-        Serial.print("] MUX2 кан ");
-        Serial.print(ch);
-        Serial.print(" raw=");
-        Serial.print(raw);
-        Serial.print(" -> ");
-        Serial.println(val ? "НАЖАТА" : "отпущена");
-
-        if (val) startShow();   // любое нажатие запускает бегущую строку
+        handleMaskTransition(maskNum, ch, "MUX2", val);
       }
     } else {
       mux2MaskCandidate[i] = val;
@@ -398,19 +961,10 @@ void scanMux2() {
     }
   }
 
-  // свечи — просто сохраняем сырые значения
+  // Свечи — просто сохраняем сырые значения, логика сравнения с паттерном будет позже.
   for (uint8_t i = 0; i < MUX2_CANDLE_COUNT; i++) {
     candleRaw[i] = readMux2(candleToChannel[i]);
   }
-}
-
-// ==================== ВЫВОД СВЕЧЕЙ ====================
-void printCandles() {
-  Serial.print("[СВЕЧИ] ");
-  for (uint8_t i = 0; i < MUX2_CANDLE_COUNT; i++) {
-    Serial.printf("C%d:%4d   ", i + 1, candleRaw[i]);
-  }
-  Serial.println();
 }
 
 // ==================== ДАМП ВСЕХ КАНАЛОВ (один раз при старте) ====================
@@ -457,11 +1011,17 @@ void setup() {
   pinMode(MUX1_SIG, INPUT);
 
   analogReadResolution(12);
+  randomSeed(esp_random());
 
   strip.begin();
   strip.setBrightness(LED_BRIGHTNESS);
   strip.clear();
   strip.show();
+
+  mqttNet.setTimeout(500);   // иначе connect() к недоступному хосту блокирует опрос на секунды
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+  mqttClient.setBufferSize(384);   // список кнопок вплотную к дефолтным 256 байт
 
   for (uint8_t i = 0; i < MUX1_CHANNELS; i++) {
     mux1State[i] = false;
@@ -473,9 +1033,8 @@ void setup() {
     mux2MaskCandidate[i] = false;
     mux2MaskCounter[i] = 0;
   }
-  for (uint8_t i = 0; i < MUX2_CANDLE_COUNT; i++) {
-    candleRaw[i] = 0;
-  }
+  for (uint8_t i = 0; i < MASK_COUNT; i++) maskVisualState[i] = VIS_FLICKER;
+  scenarioGenerate();   // нужен валидный сценарий сразу с загрузки
 
   Serial.println();
   Serial.println("========================================");
@@ -522,7 +1081,7 @@ void setup() {
     delay(80);
   }
   strip.clear();
-  strip.show();
+  strip.show();   // дальше дежурное мерцание подхватит сама updateFlicker() в loop()
 
   dumpAll();
   Serial.println("[СТАРТ] готово, опрос запущен");
@@ -538,18 +1097,19 @@ void loop() {
 
   scanMux1();
   scanMux2();
-  handleShow();
+  calibLoop();
+  gameLoop();
+  updateFlicker();
+  scenarioCheck();
+  chaseTimeoutCheck();
 
   cycleTimeSum += micros() - cycleStart;
   cycleTimeCount++;
   loopCount++;
 
   wifiCheck();
-
-  if (millis() - lastCandlePrint >= CANDLE_PRINT_MS) {
-    lastCandlePrint = millis();
-    printCandles();
-  }
+  mqttCheck();
+  mqttPublishPeriodic();
 
   if (millis() - lastStatsTime >= STATS_PRINT_MS) {
     lastStatsTime = millis();
