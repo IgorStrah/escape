@@ -58,7 +58,7 @@
 #define WIFI_RETRY_MS 5000
 
 // ---- MQTT (тестовый хаб TestHub, стенд) ----
-#define MQTT_HOST         "chrono-hub.local"
+#define MQTT_HOST         "quest-hub.local"
 #define MQTT_PORT         1883
 #define MQTT_CLIENT_ID    "chrono-scales"
 #define MQTT_DEVICE_TOPIC "quest/chronomage/scales"
@@ -387,7 +387,7 @@ void setup() {
   scaleFactor = prefs.getFloat("factor", DEFAULT_SCALE_FACTOR);
   Serial.printf("[NVS] загружено: offset=%ld factor=%.4f\n", tareOffset, scaleFactor);
 
-  mqttNet.setTimeout(500);   // иначе connect() к недоступному хосту блокирует опрос
+  mqttNet.setTimeout(150);   // короче, чтобы недоступный сервер не мешал ArduinoOTA.handle() — OTA должна работать без сервера, достаточно общей сети
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
 

@@ -48,7 +48,7 @@ IPAddress dns1    (192, 168, 8, 1);
 
 // ---- MQTT (тестовый хаб TestHub, стенд) ----
 // Хаб на DHCP, поэтому по имени через mDNS, а не по фиксированному IP.
-#define MQTT_HOST         "chrono-hub.local"
+#define MQTT_HOST         "quest-hub.local"
 #define MQTT_PORT         1883
 #define MQTT_CLIENT_ID    "chrono-masks"
 #define MQTT_DEVICE_TOPIC "quest/chronomage/masks"
@@ -120,9 +120,13 @@ IPAddress dns1    (192, 168, 8, 1);
 #define CANDLE_PUBLISH_MS  1000
 
 // ---- Мерцание пламени / цепочка касаний в простое ----
-#define FLICKER_UPDATE_MS  80
-#define FLICKER_MIN_RED     5
-#define FLICKER_MAX_RED    20   // "от 5 до 20" на красный канал
+// Не перескакиваем на новое случайное значение целиком (резкие вспышки),
+// а плавно дрейфуем маленькими шагами в границах диапазона — читается как
+// тлеющие угольки, а не моргание.
+#define FLICKER_UPDATE_MS   40   // чаще, чем раньше — дрейф мелкими шагами незаметен иначе
+#define FLICKER_MIN_RED      5
+#define FLICKER_MAX_RED     20   // "от 5 до 20" на красный канал
+#define FLICKER_STEP_MAX     1   // максимальный шаг дрейфа за один тик
 
 // ============================================================
 // ТАБЛИЦА: МАСКА -> ПАРА СВЕТОДИОДОВ
@@ -232,6 +236,7 @@ unsigned long gameDeadline  = 0;
 #define VIS_DONE    2
 #define VIS_CELEBRATE 3   // весь сценарий пройден — держим зелёный до новой генерации
 uint8_t maskVisualState[MASK_COUNT];   // индекс = maskNum-1
+uint8_t flickerRed[MASK_COUNT];        // текущая яркость угольков, дрейфует плавно
 
 unsigned long lastFlickerUpdate = 0;
 
@@ -685,7 +690,14 @@ void updateFlicker() {
   bool changed = false;
   for (uint8_t maskNum = 1; maskNum <= MASK_COUNT; maskNum++) {
     if (maskVisualState[maskNum - 1] != VIS_FLICKER) continue;
-    setMaskColor(maskNum, random(FLICKER_MIN_RED, FLICKER_MAX_RED + 1), 0, 0);
+
+    int8_t step = (int8_t)random(-FLICKER_STEP_MAX, FLICKER_STEP_MAX + 1);
+    int newVal = (int)flickerRed[maskNum - 1] + step;
+    if (newVal < FLICKER_MIN_RED) newVal = FLICKER_MIN_RED;
+    if (newVal > FLICKER_MAX_RED) newVal = FLICKER_MAX_RED;
+    flickerRed[maskNum - 1] = (uint8_t)newVal;
+
+    setMaskColor(maskNum, flickerRed[maskNum - 1], 0, 0);
     changed = true;
   }
   if (changed) strip.show();
@@ -1018,7 +1030,7 @@ void setup() {
   strip.clear();
   strip.show();
 
-  mqttNet.setTimeout(500);   // иначе connect() к недоступному хосту блокирует опрос на секунды
+  mqttNet.setTimeout(150);   // короче, чтобы недоступный сервер не мешал ArduinoOTA.handle() — OTA должна работать без сервера, достаточно общей сети
   mqttClient.setServer(MQTT_HOST, MQTT_PORT);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setBufferSize(384);   // список кнопок вплотную к дефолтным 256 байт
@@ -1033,7 +1045,10 @@ void setup() {
     mux2MaskCandidate[i] = false;
     mux2MaskCounter[i] = 0;
   }
-  for (uint8_t i = 0; i < MASK_COUNT; i++) maskVisualState[i] = VIS_FLICKER;
+  for (uint8_t i = 0; i < MASK_COUNT; i++) {
+    maskVisualState[i] = VIS_FLICKER;
+    flickerRed[i] = (uint8_t)random(FLICKER_MIN_RED, FLICKER_MAX_RED + 1);   // старт не синхронно
+  }
   scenarioGenerate();   // нужен валидный сценарий сразу с загрузки
 
   Serial.println();
